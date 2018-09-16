@@ -1,0 +1,50 @@
+[package]
+name = "vmem"
+version = "0.1.0"
+authors = ["Jonas Schievink <jonasschievink@gmail.com>"]
+description = "Virtual memory manipulation using mmap/VirtualAlloc"
+documentation = "https://docs.rs/vmem/"
+repository = "https://github.com/jonas-schievink/vmem.git"
+keywords = ["virtual", "memory", "mmap", "memory", "map"]
+categories = ["memory-management"]
+readme = "README.md"
+license = "CC0-1.0"
+
+[dependencies]
+failure = "0.1.2"
+page_size = "0.4.1"
+
+[dev-dependencies]
+version-sync = "0.5"
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3.5", features = ["memoryapi"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.43"
+
+
+# cargo-release configuration
+[package.metadata.release]
+tag-message = "{{version}}"
+no-dev-version = true
+pre-release-commit-message = "Release {{version}}"
+
+# Change the changelog's `Unreleased` section to refer to this release and
+# prepend new `Unreleased` section
+[[package.metadata.release.pre-release-replacements]]
+file    = "CHANGELOG.md"
+search  = "## Unreleased"
+replace = "## Unreleased\n\nNo changes.\n\n## {{version}} - {{date}}"
+
+# Bump the version inside the example manifest in `README.md`
+[[package.metadata.release.pre-release-replacements]]
+file    = "README.md"
+search  = 'vmem = "[a-z0-9\\.-]+"'
+replace = 'vmem = "{{version}}"'
+
+# Bump the version referenced by the `html_root_url` attribute in `lib.rs`
+[[package.metadata.release.pre-release-replacements]]
+file    = "src/lib.rs"
+search  = "https://docs.rs/vmem/[a-z0-9\\.-]+"
+replace = "https://docs.rs/vmem/{{version}}"
