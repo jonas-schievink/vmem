@@ -57,13 +57,13 @@ mod imp {
         }
     }
 
-    /// Allocate already reserved memory.
+    /// Allocate already reserved readable and writeable memory.
     ///
     /// This can assume that `addr` is already reserved and that `bytes` fits in
     /// the reserved memory.
-    pub fn alloc(addr: usize, bytes: usize, prot: Protection) -> Result<(), io::Error> {
+    pub fn alloc(addr: usize, bytes: usize) -> Result<(), io::Error> {
         let ret = unsafe {
-            map(addr, bytes, Some(prot), MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED)?
+            map(addr, bytes, Some(Protection::ReadWrite), MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED)?
         };
         assert_eq!(addr, ret as usize);
         Ok(())
@@ -124,13 +124,13 @@ mod imp {
         }
     }
 
-    /// Allocate already reserved memory.
+    /// Allocate already reserved readable and writeable memory.
     ///
     /// This can assume that `addr` is already reserved and that `bytes` fits in
     /// the reserved memory.
-    pub fn alloc(addr: usize, bytes: usize, prot: Protection) -> Result<(), io::Error> {
+    pub fn alloc(addr: usize, bytes: usize) -> Result<(), io::Error> {
         let ret = unsafe {
-            VirtualAlloc(addr as *mut _, bytes, MEM_COMMIT, self::prot(prot))
+            VirtualAlloc(addr as *mut _, bytes, MEM_COMMIT, PAGE_READWRITE)
         };
         assert_eq!(addr, ret as usize);
         Ok(())
@@ -225,22 +225,22 @@ impl ReservedMemory {
     }
 
     /// Allocates pages inside this reserved memory section and makes them
-    /// accessible.
+    /// readable and writeable.
     ///
     /// The content of the pages is undefined. Don't assume allocated memory
     /// always starts out zeroed.
+    ///
+    /// After writing your data to the allocation, you can mark it as read-only
+    /// or executable using `AllocatedMemory::set_protection`.
     ///
     /// # Parameters
     ///
     /// * `offset`: Offset into the reserved address space.
     /// * `bytes`: Number of bytes to allocate.
-    /// * `prot`: The desired memory protection mode.
-    // FIXME: Consider dropping `prot` and always using ReadWrite instead
     pub fn allocate(
         &self,
         offset: usize,
         bytes: usize,
-        prot: Protection
     ) -> Result<AllocatedMemory, Error> {
         self.addr.checked_add(offset).and_then(|sum| sum.checked_add(bytes))
             .ok_or_else(|| ErrorKind::TooLarge)?;  // overflow
@@ -267,14 +267,14 @@ impl ReservedMemory {
         }
 
         let addr = self.addr + offset;
-        imp::alloc(addr, bytes, prot).map_err(ErrorKind::Os)?;
+        imp::alloc(addr, bytes).map_err(ErrorKind::Os)?;
 
         allocs.register_allocation(offset, bytes);
 
         Ok(AllocatedMemory {
             addr,
             len: bytes,
-            prot,
+            prot: Protection::ReadWrite,
             _p: PhantomData,
         })
     }
@@ -454,57 +454,57 @@ mod tests {
     #[test]
     fn alloc() {
         let mem = ReservedMemory::reserve(1024 * 1024);
-        mem.allocate(0, 1, Protection::ReadOnly)
+        mem.allocate(0, 1)
             .expect("failed to allocate page");
-        mem.allocate(0, 1, Protection::ReadOnly)
+        mem.allocate(0, 1)
             .expect_err("allocated page twice");
-        mem.allocate(page_size::get() - 1, 1, Protection::ReadOnly)
+        mem.allocate(page_size::get() - 1, 1)
             .expect_err("allocated first page twice (at end)");
 
-        mem.allocate(page_size::get(), 1, Protection::ReadOnly)
+        mem.allocate(page_size::get(), 1)
             .expect("failed to allocate second page");
-        mem.allocate(page_size::get(), 1, Protection::ReadOnly)
+        mem.allocate(page_size::get(), 1)
             .expect_err("allocated second page twice");
-        mem.allocate(0, 1, Protection::ReadOnly)
+        mem.allocate(0, 1)
             .expect_err("allocated page twice");
 
 
         let mem = ReservedMemory::reserve(1024 * 1024);
-        mem.allocate(0, page_size::get(), Protection::ReadWrite)
+        mem.allocate(0, page_size::get())
             .expect("failed to allocate");
-        mem.allocate(page_size::get(), 1, Protection::ReadWrite)
+        mem.allocate(page_size::get(), 1)
             .expect("failed to allocate second page");
     }
 
     #[test]
     fn alloc_same_page_different_offset() {
         let mem = ReservedMemory::reserve(1024 * 1024);
-        mem.allocate(0, 1, Protection::ReadOnly)
+        mem.allocate(0, 1)
             .expect("failed to allocate page");
-        mem.allocate(1, 1, Protection::ReadOnly)
+        mem.allocate(1, 1)
             .expect_err("allocated page twice");
-        mem.allocate(page_size::get()-10, 1, Protection::ReadOnly)
+        mem.allocate(page_size::get()-10, 1)
             .expect_err("allocated page twice");
     }
 
     #[test]
     fn doesnt_fit() {
         let mem = ReservedMemory::reserve(1024 * 1024);
-        mem.allocate(1024 * 1024 - page_size::get(), page_size::get() + 1, Protection::ReadWrite)
+        mem.allocate(1024 * 1024 - page_size::get(), page_size::get() + 1)
             .expect_err("allocated more than last page");
-        mem.allocate(1024 * 1024, 1, Protection::ReadWrite)
+        mem.allocate(1024 * 1024, 1)
             .expect_err("allocated past last page");
-        mem.allocate(1024 * 1024 * 256, 1, Protection::ReadWrite)
+        mem.allocate(1024 * 1024 * 256, 1)
             .expect_err("allocated past last page");
 
-        mem.allocate(1024 * 1024 - page_size::get(), page_size::get(), Protection::ReadWrite)
+        mem.allocate(1024 * 1024 - page_size::get(), page_size::get())
             .expect("couldn't allocate last page");
     }
 
     #[test]
     fn page_boundary() {
         let mem = ReservedMemory::reserve(1024 * 1024);
-        mem.allocate(1024 + 1, 1, Protection::ReadOnly)
+        mem.allocate(1024 + 1, 1)
             .expect_err("allocation not on page boundary succeeded");
     }
 
@@ -516,7 +516,7 @@ mod tests {
     #[test]
     fn access() {
         let mem = ReservedMemory::reserve(1024 * 1024);
-        let alloc = mem.allocate(0, page_size::get(), Protection::ReadOnly)
+        let alloc = mem.allocate(0, page_size::get())
             .expect("failed to allocate");
 
         // Reading the allocated memory might yield garbage values, but should
