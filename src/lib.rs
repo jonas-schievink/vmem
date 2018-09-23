@@ -4,6 +4,9 @@
 //! allocating RAM for the whole space, and allows subsequently allocating
 //! arbitrary subranges of the reserved address space.
 //!
+//! The permissions (read, write, execute) of allocated memory can be changed
+//! and a memory fault handler can be installed to react to invalid operations.
+//!
 //! The main use case of this is in emulators, where rebuilding the target
 //! system's memory map can eliminate memory access checks and drastically
 //! improve performance.
@@ -17,157 +20,97 @@
 extern crate failure;
 extern crate page_size;
 
+#[cfg(unix)]
+#[path = "unix.rs"]
+mod imp;
+
+#[cfg(windows)]
+#[path = "windows.rs"]
+mod imp;
+
+pub mod signal_safe;
+
 use failure::{Backtrace, Fail};
 
 use std::marker::PhantomData;
 use std::ops::Range;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{fmt, io};
+use std::os::raw::c_void;
 
-#[cfg(unix)]
-mod imp {
-    extern crate libc;
+/// Type of the memory fault handler installed by the library. Internally used.
+///
+/// Returns `true` when the fault happened in the watched memory region and the
+/// user handler was invoked. The OS should then restore the context, which
+/// allows the program to retry the access, or, if the context was modified
+/// accordingly and the OS supports this, to skip the offending instruction.
+///
+/// If this returns `false`, the original handler should be invoked, which is
+/// likely to be Rust's stack overflow detection handler. Note that this must
+/// *not* deregister our handler, though. However, when this happens the program
+/// will probably be aborted anyways.
+type FaultHandler = unsafe fn(fault_addr: usize, context: *mut c_void) -> bool /* handled? */;
 
-    use self::libc::{
-        c_void, c_int, mmap, munmap, mprotect, PROT_NONE, PROT_READ, PROT_WRITE, PROT_EXEC,
-        MAP_PRIVATE, MAP_ANONYMOUS, MAP_FIXED, MAP_FAILED
-    };
-    use Protection;
-    use std::{io, usize};
+/// Ensures that only one signal handler is active at a time.
+///
+/// Attempting to register a signal handler while this is `true` will cause a
+/// panic. Unregistering the signal handler will reset this to `false`.
+///
+/// The library sets this to `true` before registering the handler using the
+/// platform-specific `imp` module, which blocks all future attempts to register
+/// a handler until the handler is removed.
+static FAULT_HANDLER_REGISTERED: AtomicBool = AtomicBool::new(false);
 
-    unsafe fn map(
-        addr: usize,
-        bytes: usize,
-        prot: Option<Protection>,
-        flags: c_int
-    ) -> Result<*mut c_void, io::Error> {
-        let prot = prot.map(self::prot).unwrap_or(PROT_NONE);
-        let ret = mmap(addr as *mut _, bytes, prot, flags, -1, 0);
-        if ret == MAP_FAILED {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(ret)
-        }
-    }
-
-    /// Reserve address space without backing RAM anywhere in memory.
-    pub fn reserve(bytes: usize) -> Result<*mut c_void, io::Error> {
-        unsafe {
-            map(0, bytes, None, MAP_PRIVATE | MAP_ANONYMOUS)
-        }
-    }
-
-    /// Allocate already reserved readable and writeable memory.
-    ///
-    /// This can assume that `addr` is already reserved and that `bytes` fits in
-    /// the reserved memory.
-    pub fn alloc(addr: usize, bytes: usize) -> Result<(), io::Error> {
-        let ret = unsafe {
-            map(addr, bytes, Some(Protection::ReadWrite), MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED)?
-        };
-        assert_eq!(addr, ret as usize);
-        Ok(())
-    }
-
-    /// Free all mappings (allocations and reservations) overlapping any address
-    /// between `addr` and `addr+bytes`.
-    pub unsafe fn unreserve(addr: usize, bytes: usize) -> Result<(), io::Error> {
-        if munmap(addr as *mut _, bytes) == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
-    }
-
-    /// Changes the protection of a memory region allocated using `alloc`.
-    pub fn protect(addr: usize, bytes: usize, prot: Protection) -> Result<(), io::Error> {
-        unsafe {
-            if mprotect(addr as *mut _, bytes, self::prot(prot)) == 0 {
-                Ok(())
-            } else {
-                Err(io::Error::last_os_error())
-            }
-        }
-    }
-
-    fn prot(prot: Protection) -> c_int {
-        match prot {
-            Protection::ReadOnly => PROT_READ,
-            Protection::ReadWrite => PROT_READ | PROT_WRITE,
-            Protection::ReadExecute => PROT_READ | PROT_EXEC,
-        }
-    }
+/// Information needed by registered signal handlers to determine
+/// whether they should handle the fault.
+struct HandlerInfo {
+    /// Start address of the `ReservedMemory` area that is being
+    /// watched.
+    addr: usize,
+    /// Length of the memory area being watched.
+    len: usize,
+    fault_handler: Option<Box<FnMut(&FaultInfo)>>,
 }
 
-#[cfg(windows)]
-mod imp {
-    extern crate winapi;
+static mut FAULT_HANDLER_INFO: HandlerInfo = HandlerInfo {
+    addr: 0,
+    len: 0,
+    fault_handler: None,
+};
 
-    use self::winapi::ctypes::c_void;
-    use self::winapi::um::memoryapi::{VirtualAlloc, VirtualFree, VirtualProtect};
-    use self::winapi::shared::minwindef::DWORD;
-    use self::winapi::um::winnt::{
-        MEM_RESERVE, MEM_COMMIT, MEM_RELEASE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
-        PAGE_EXECUTE_READ
-    };
-
-    use Protection;
-    use std::{io, ptr, usize};
-
-    /// Reserve address space without backing RAM anywhere in memory.
-    pub fn reserve(bytes: usize) -> Result<*mut c_void, io::Error> {
-        let ret = unsafe { VirtualAlloc(ptr::null_mut(), bytes, MEM_RESERVE, PAGE_NOACCESS) };
-        if ret == ptr::null_mut() {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(ret)
-        }
-    }
-
-    /// Allocate already reserved readable and writeable memory.
+/// Information about a segmentation fault.
+#[derive(Debug)]
+pub struct FaultInfo {
+    /// Offset into the `ReservedMemory` that triggered the fault.
     ///
-    /// This can assume that `addr` is already reserved and that `bytes` fits in
-    /// the reserved memory.
-    pub fn alloc(addr: usize, bytes: usize) -> Result<(), io::Error> {
-        let ret = unsafe {
-            VirtualAlloc(addr as *mut _, bytes, MEM_COMMIT, PAGE_READWRITE)
-        };
-        assert_eq!(addr, ret as usize);
-        Ok(())
-    }
+    /// The program made an attempt to access this address in a way that was not
+    /// allowed by the page's configured `Protection`.
+    pub fault_offset: usize,
 
-    /// Free all mappings (allocations and reservations) overlapping any address
-    /// between `addr` and `addr+bytes`.
-    pub unsafe fn unreserve(addr: usize, _bytes: usize) -> Result<(), io::Error> {
-        // size is not needed, the entire reserved block is freed
-        let ret = VirtualFree(addr as *mut _, 0, MEM_RELEASE);
+    /// Pointer to the saved processor context.
+    ///
+    /// The context is an OS- and architecture-dependent structure containing
+    /// register values. Depending on the operating system, you can modify the
+    /// fields in here to change the processor state on return from the handler.
+    ///
+    /// Platform-specific details:
+    /// * On POSIX systems, this points to a `ucontext_t` structure. The pointer
+    ///   is obtained as an argument to the signal handling function
+    ///   (`sa_sigaction`). Refer to [`sigaction(2)`] for details.
+    /// * On Windows, this points to a `CONTEXT` structure. The pointer is
+    ///   obtained through the `_EXCEPTION_POINTERS` structure passed to the
+    ///   vectored exception handler registered by this library.
+    ///
+    /// [`sigaction(2)`]: http://man7.org/linux/man-pages/man2/sigaction.2.html
+    pub context: *mut c_void,
 
-        if ret == 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Changes the protection of a memory region allocated using `alloc`.
-    pub fn protect(addr: usize, bytes: usize, prot: Protection) -> Result<(), io::Error> {
-        unsafe {
-            if VirtualProtect(addr as *mut _, bytes, self::prot(prot), ptr::null_mut()) == 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
-        }
-    }
-
-    fn prot(prot: Protection) -> DWORD {
-        match prot {
-            Protection::ReadOnly => PAGE_READONLY,
-            Protection::ReadWrite => PAGE_READWRITE,
-            Protection::ReadExecute => PAGE_EXECUTE_READ,
-        }
-    }
+    /// Keep the struct extensible without breaking changes.
+    _private: (),
 }
+
+// FIXME This model is incompatible with Windows' (rather pathetic) huge page support
+// Linux' THP should Just Work™, but we might want to expose `madvise`.
 
 /// A contiguous chunk of reserved address space.
 ///
@@ -176,17 +119,23 @@ mod imp {
 /// does *not* mean that the memory is accessible or allocated. In fact, it is
 /// guaranteed that any access to any byte within the `ReservedMemory` will
 /// cause a segmentation fault or an equivalent error.
+///
+/// Parts of the reserved memory region can be allocated and made accessible by
+/// calling [`allocate`][#method.allocate].
 #[derive(Debug)]
 pub struct ReservedMemory {
     addr: usize,
     len: usize,
-    /// List of allocations created within this reservation. Range value are
+    /// List of allocations created within this reservation. Range values are
     /// offsets into `self`.
     ///
     /// Behind a mutex that needs to be locked before any attempt at allocation
     /// is made. In particular, `imp::alloc` must only be called when this is
-    /// locked.
+    /// locked. Failure to do so can result in the OS having a different view
+    /// of our allocated memory than we do, and racing to allocate will then
+    /// likely cause havoc.
     allocations: Mutex<Allocations>,
+    owns_fault_handler: bool,
 }
 
 impl ReservedMemory {
@@ -198,6 +147,10 @@ impl ReservedMemory {
     }
 
     /// Tries to reserve at least `bytes` Bytes of virtual memory.
+    ///
+    /// Returns an error when the OS cannot allocate the memory. This is most
+    /// likely to happen when allocating an extremely large amount, or when
+    /// allocating moderate amounts on a heavily fragmented 32-bit system.
     pub fn try_reserve(bytes: usize) -> Result<Self, Error> {
         match imp::reserve(bytes) {
             Ok(ptr) => Ok(Self {
@@ -206,6 +159,7 @@ impl ReservedMemory {
                 allocations: Mutex::new(Allocations {
                     list: Vec::new(),
                 }),
+                owns_fault_handler: false,
             }),
             Err(e) => Err(ErrorKind::Os(e).into())
         }
@@ -218,8 +172,20 @@ impl ReservedMemory {
         self.addr
     }
 
+    /// Returns the size of the reserved memory region in bytes.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
     /// Returns the system's page size, the smallest amount of memory that can
-    /// be allocated and manipulated by this library.
+    /// be manipulated by this library.
+    ///
+    /// Note that this is not necessarily the smallest amount of address space
+    /// that can be allocated. For example, Windows might have a different
+    /// address space allocation granularity (`dwAllocationGranularity` in
+    /// [`SYSTEM_INFO`]).
+    ///
+    /// [`SYSTEM_INFO`]: https://msdn.microsoft.com/en-us/library/windows/desktop/ms724958(v=vs.85).aspx
     pub fn page_size(&self) -> usize {
         page_size::get()
     }
@@ -237,6 +203,9 @@ impl ReservedMemory {
     ///
     /// * `offset`: Offset into the reserved address space.
     /// * `bytes`: Number of bytes to allocate.
+    // NB: This takes `&self` to allow multiple `AllocatedMemory` instances to
+    // coexist. Otherwise a single one would permanently borrow `self`. It
+    // should still be thread-safe.
     pub fn allocate(
         &self,
         offset: usize,
@@ -278,10 +247,127 @@ impl ReservedMemory {
             _p: PhantomData,
         })
     }
+    // TODO: Test thread-safety of `allocate`
+
+    /// Configures a memory fault handler to be run when an access inside this
+    /// `ReservedMemory` region triggers a fault.
+    ///
+    /// Only one fault handler can be registered for the entire application.
+    /// Attempting to register a handler while another one is already
+    /// established will likely cause a panic (but note that external changes to
+    /// the signal handlers can not be detected - changing the handlers
+    /// externally will cause any fault to abort the program instead).
+    ///
+    /// The default action (when this handler isn't set) is to abort the
+    /// process. When this handler is configured, it will be called instead and
+    /// is given the opportunity to fix the fault condition. When the handler
+    /// returns, the access will be retried. If the handler doesn't fix the
+    /// fault condition, it will immediately be invoked again as the same fault
+    /// will happen again.
+    ///
+    /// This can *not* be used as a protection against broken code that causes
+    /// segmentation faults. It can only be used safely under well-controlled
+    /// circumstances.
+    ///
+    /// # Safety
+    ///
+    /// **This function has numerous safety requirements that might be hard to
+    /// get right. Take care!**
+    ///
+    /// Signal handlers are a global resource: Access to them must be externally
+    /// synchronized. This function must not be called while other code might be
+    /// setting signal handlers. It is recommended to call this once at
+    /// application startup. While the library will guard against setting a
+    /// handler while one is already in place, it can't prevent other libraries
+    /// from changing handlers.
+    ///
+    /// On Unix-like systems, the handler must not call any async-signal unsafe
+    /// functions. See [`signal-safety(7)`][man] for more info. The
+    /// `signal_safe` module provides a few methods that are implemented using
+    /// only signal-safe primitives.
+    ///
+    // TODO: Requirements on Windows
+    ///
+    /// [man]: http://man7.org/linux/man-pages/man7/signal-safety.7.html
+    // The `F: 'static` requirement is unfortunate but (I think) required: While
+    // technically all we need is `F: 'self`, `self` could be leaked, never
+    // unregistering the fault handler, while could then be called after `'self`
+    // has already expired.
+    pub unsafe fn set_fault_handler<F>(&mut self, f: F)
+    where F: Fn(&FaultInfo) + Sync + 'static {    // FIXME: Needs Send?
+        if FAULT_HANDLER_REGISTERED.swap(true, Ordering::SeqCst) {
+            // flag was already set
+            panic!("a fault handler is already registered");
+        }
+
+        self.owns_fault_handler = true;
+
+        // Safe: We've locked all access to the signal info by setting
+        // `FAULT_HANDLER_REGISTERED` to `true`.
+        FAULT_HANDLER_INFO.addr = self.addr;
+        FAULT_HANDLER_INFO.len = self.len;
+        FAULT_HANDLER_INFO.fault_handler = Some(Box::new(f));
+
+        imp::register_fault_handler(fault_handler);
+
+        unsafe fn fault_handler(fault_addr: usize, context: *mut c_void) -> bool /* handled? */ {
+            let addr = FAULT_HANDLER_INFO.addr;
+            let len = FAULT_HANDLER_INFO.len;
+            if fault_addr >= addr
+                && fault_addr < addr + len {
+
+                (FAULT_HANDLER_INFO.fault_handler.as_mut().unwrap())(&FaultInfo {
+                    fault_offset: fault_addr - addr,
+                    context,
+                    _private: (),
+                });
+                true
+            } else {
+                // Not in the watched range
+                false
+            }
+        }
+
+        // TODO: Test multi-threaded behaviour:
+        // TODO: Race-conditions when registering a handler
+        // TODO: Registering the handler, then faulting on a different thread
+        // (or on 2 threads simultaneously - this must not yield 2 &mut to the
+        // callback!)
+    }
+
+    /// Unregisters a fault handler previously set using `set_fault_handler`.
+    ///
+    /// Returns the handler passed to `set_fault_handler`, or `None` if no
+    /// handler has been registered for this `ReservedMemory` instance.
+    ///
+    /// The handler will also be unregistered automatically when the
+    /// corresponding `ReservedMemory` is dropped.
+    ///
+    /// After the handler is cleared, a new handler can be installed by calling
+    /// `set_fault_handler` again.
+    pub fn clear_fault_handler(&mut self) -> Option<Box<FnMut(&FaultInfo)>> {
+        if self.owns_fault_handler {
+            unsafe {
+                imp::deregister_fault_handler();
+
+                self.owns_fault_handler = false;
+                let handler = FAULT_HANDLER_INFO.fault_handler.take();
+                assert!(handler.is_some());
+
+                // Release the fault handler lock. This must be done last.
+                FAULT_HANDLER_REGISTERED.store(false, Ordering::SeqCst);
+
+                handler
+            }
+        } else {
+            None
+        }
+    }
 }
 
 impl Drop for ReservedMemory {
     fn drop(&mut self) {
+        self.clear_fault_handler();
         unsafe {
             imp::unreserve(self.addr, self.len).expect("failed to deallocate memory");
         }
@@ -333,7 +419,8 @@ impl Allocations {
 ///
 /// Obtained via `ReservedMemory::allocate`. Note that the memory will *not* be
 /// automatically deallocated when this is dropped. Instead, the whole memory
-/// reservation will be deallocated when the `ReservedMemory` is dropped.
+/// reservation along with all allocations contained within will be deallocated
+/// when the `ReservedMemory` is dropped.
 #[derive(Debug)]
 pub struct AllocatedMemory<'a> {
     addr: usize,
@@ -344,6 +431,19 @@ pub struct AllocatedMemory<'a> {
 
 impl<'a> AllocatedMemory<'a> {
     /// Returns the address of this allocated memory block.
+    ///
+    /// Starting at this address, `self.len()` bytes are accessible according to
+    /// `self.protection()`. The user must make sure these bytes are used in a
+    /// safe manner (no mutable aliasing, only transmute to any type `T` when
+    /// the bytes at that location form a valid `T`, etc.). This is especially
+    /// important in a multi-threaded setting, as no data races must occur.
+    ///
+    /// Note that neither the `AllocatedMemory` that logically owns the memory
+    /// nor the `ReservedMemory` that logically owns the `AllocatedMemory` will
+    /// attempt to access the allocated memory in any way. This allows having
+    /// mutable access to the `AllocatedMemory`, while the actual memory at
+    /// `self.addr()` is being immutably or mutably referenced or changed
+    /// (possibly by another thread).
     pub fn addr(&self) -> usize {
         self.addr
     }
@@ -362,10 +462,19 @@ impl<'a> AllocatedMemory<'a> {
     }
 
     /// Changes the memory protection settings of this block.
+    ///
+    /// When changing the memory area from being writeable to being read-only,
+    /// you must ensure that no Rust references (whether immutable or mutable)
+    /// to any part of the affected memory exist, since the compiler assumes
+    /// that those always point to dereferenceable memory and may perform
+    /// speculative reads that could then trap. In other word, this would be
+    /// *undefined behaviour*, so don't do it.
     pub fn set_protection(&mut self, prot: Protection) {
         imp::protect(self.addr, self.len, prot)
-            .expect("could not change protection")  // should never happen
+            .expect("could not change protection");  // should never happen
+        self.prot = prot;
     }
+    // FIXME Test `set_protection` followed by `{set_,}protection`
 }
 
 /// Defines the protection level of a block of allocated memory.
@@ -374,7 +483,7 @@ impl<'a> AllocatedMemory<'a> {
 /// causes a segmentation fault or your platform's equivalent), while allocated
 /// memory is at the very least readable, but may also be marked as writeable or
 /// executable.
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Protection {
     /// The memory is only readable.
     ///
@@ -388,6 +497,7 @@ pub enum Protection {
     ReadWrite,
     /// The memory is readable and executable, but not writeable.
     ReadExecute,
+    // TODO: Make extensible?
 }
 
 /// The error type used by this library.
@@ -437,6 +547,7 @@ enum ErrorKind {
 Tests:
 * Test for leaks
 * `mem::forget` AllocatedMemory, then drop ReservedMemory normally - should not leak anything!
+* SEGFAULT-inducing tests
 
 */
 
@@ -518,12 +629,14 @@ mod tests {
         let mem = ReservedMemory::reserve(1024 * 1024);
         let alloc = mem.allocate(0, page_size::get())
             .expect("failed to allocate");
+        assert_eq!(alloc.protection(), Protection::ReadWrite);
 
         // Reading the allocated memory might yield garbage values, but should
         // be safe, since any byte is a valid `u8`.
         for addr in alloc.addr()..alloc.addr()+alloc.len() {
             unsafe {
-                ptr::read(addr as *const u8);
+                ptr::read_volatile(addr as *const u8);
+                ptr::write_volatile(addr as *mut u8, 0xAB);
             }
         }
     }

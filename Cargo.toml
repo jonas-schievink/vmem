@@ -2,10 +2,12 @@
 name = "vmem"
 version = "0.1.0"
 authors = ["Jonas Schievink <jonasschievink@gmail.com>"]
-description = "Virtual memory manipulation using mmap/VirtualAlloc"
+description = """
+Virtual memory manipulation, allocation and segmentation fault handling
+"""
 documentation = "https://docs.rs/vmem/"
 repository = "https://github.com/jonas-schievink/vmem.git"
-keywords = ["virtual", "memory", "mmap", "memory", "map"]
+keywords = ["memory", "map", "mmap", "fault", "segfault"]
 categories = ["memory-management"]
 readme = "README.md"
 license = "CC0-1.0"
