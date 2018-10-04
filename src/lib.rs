@@ -199,6 +199,10 @@ impl ReservedMemory {
     /// After writing your data to the allocation, you can mark it as read-only
     /// or executable using `AllocatedMemory::set_protection`.
     ///
+    /// Note that this function is ***not** signal-safe* as it needs to keep
+    /// track of allocated memory regions in a thread-safe way (which means
+    /// locking some synchronization primitive).
+    ///
     /// # Parameters
     ///
     /// * `offset`: Offset into the reserved address space.
@@ -243,7 +247,6 @@ impl ReservedMemory {
         Ok(AllocatedMemory {
             addr,
             len: bytes,
-            prot: Protection::ReadWrite,
             _p: PhantomData,
         })
     }
@@ -282,17 +285,18 @@ impl ReservedMemory {
     /// from changing handlers.
     ///
     /// On Unix-like systems, the handler must not call any async-signal unsafe
-    /// functions. See [`signal-safety(7)`][man] for more info. The
-    /// `signal_safe` module provides a few methods that are implemented using
-    /// only signal-safe primitives.
+    /// functions. Note that this includes memory allocation. See
+    /// [`signal-safety(7)`][man] for more info. The `signal_safe` module
+    /// provides a few methods that are implemented using only signal-safe
+    /// primitives.
     ///
     // TODO: Requirements on Windows
     ///
     /// [man]: http://man7.org/linux/man-pages/man7/signal-safety.7.html
     // The `F: 'static` requirement is unfortunate but (I think) required: While
     // technically all we need is `F: 'self`, `self` could be leaked, never
-    // unregistering the fault handler, while could then be called after `'self`
-    // has already expired.
+    // unregistering the fault handler, while `f` could then be called after
+    // `'self` has already expired.
     pub unsafe fn set_fault_handler<F>(&mut self, f: F)
     where F: Fn(&FaultInfo) + Sync + 'static {    // FIXME: Needs Send?
         if FAULT_HANDLER_REGISTERED.swap(true, Ordering::SeqCst) {
@@ -425,7 +429,6 @@ impl Allocations {
 pub struct AllocatedMemory<'a> {
     addr: usize,
     len: usize,
-    prot: Protection,
     _p: PhantomData<&'a ()>,
 }
 
@@ -456,25 +459,24 @@ impl<'a> AllocatedMemory<'a> {
         self.len
     }
 
-    /// Returns the memory protection settings of this memory block.
-    pub fn protection(&self) -> Protection {
-        self.prot
-    }
-
     /// Changes the memory protection settings of this block.
     ///
     /// When changing the memory area from being writeable to being read-only,
     /// you must ensure that no Rust references (whether immutable or mutable)
     /// to any part of the affected memory exist, since the compiler assumes
     /// that those always point to dereferenceable memory and may perform
-    /// speculative reads that could then trap. In other word, this would be
+    /// speculative reads that could then trap. In other words, this would be
     /// *undefined behaviour*, so don't do it.
-    pub fn set_protection(&mut self, prot: Protection) {
+    ///
+    /// This function is signal-safe.
+    pub fn set_protection(&self, prot: Protection) {
         imp::protect(self.addr, self.len, prot)
             .expect("could not change protection");  // should never happen
-        self.prot = prot;
     }
-    // FIXME Test `set_protection` followed by `{set_,}protection`
+
+    // Note that we can't really provide a getter for the current protection.
+    // There is no portable OS API and storing a separate atomic variable
+    // would cause races.
 }
 
 /// Defines the protection level of a block of allocated memory.
@@ -484,6 +486,7 @@ impl<'a> AllocatedMemory<'a> {
 /// memory is at the very least readable, but may also be marked as writeable or
 /// executable.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[repr(u8)]
 pub enum Protection {
     /// The memory is only readable.
     ///
@@ -492,11 +495,11 @@ pub enum Protection {
     /// behaviour, while creating a `&T` is okay as long as the data at the
     /// address is a valid `T` (the usual rules for casting uninitialized /
     /// zeroed memory to references apply).
-    ReadOnly,
+    ReadOnly = 0,
     /// The memory is readable and writeable.
-    ReadWrite,
+    ReadWrite = 1,
     /// The memory is readable and executable, but not writeable.
-    ReadExecute,
+    ReadExecute = 2,
     // TODO: Make extensible?
 }
 
@@ -629,7 +632,6 @@ mod tests {
         let mem = ReservedMemory::reserve(1024 * 1024);
         let alloc = mem.allocate(0, page_size::get())
             .expect("failed to allocate");
-        assert_eq!(alloc.protection(), Protection::ReadWrite);
 
         // Reading the allocated memory might yield garbage values, but should
         // be safe, since any byte is a valid `u8`.

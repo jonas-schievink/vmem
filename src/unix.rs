@@ -36,6 +36,7 @@ pub fn reserve(bytes: usize) -> Result<*mut c_void, io::Error> {
 /// This can assume that `addr` is already reserved and that `bytes` fits in
 /// the reserved memory.
 pub fn alloc(addr: usize, bytes: usize) -> Result<(), io::Error> {
+    // FIXME: The memory is already mapped, is `mprotect` enough
     let ret = unsafe {
         map(addr, bytes, Some(Protection::ReadWrite), MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED)?
     };
