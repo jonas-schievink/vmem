@@ -274,7 +274,6 @@ impl ReservedMemory {
         Ok(AllocatedMemory {
             addr,
             len: bytes,
-            prot: Protection::ReadWrite,
             _p: PhantomData,
         })
     }
@@ -338,7 +337,6 @@ impl Allocations {
 pub struct AllocatedMemory<'a> {
     addr: usize,
     len: usize,
-    prot: Protection,
     _p: PhantomData<&'a ()>,
 }
 
@@ -354,11 +352,6 @@ impl<'a> AllocatedMemory<'a> {
     /// can be accessed according to the current protection.
     pub fn len(&self) -> usize {
         self.len
-    }
-
-    /// Returns the memory protection settings of this memory block.
-    pub fn protection(&self) -> Protection {
-        self.prot
     }
 
     /// Changes the memory protection settings of this block.
