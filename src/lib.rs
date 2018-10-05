@@ -258,7 +258,7 @@ impl ReservedMemory {
         }
 
         if offset & (self.page_size() - 1) != 0 {
-            return Err(ErrorKind::NotAligned.into());   // not a multiple of the page size
+            return Err(ErrorKind::NotAligned(offset).into());   // not a multiple of the page size
         }
 
         // round the amount of memory up to full pages
@@ -425,8 +425,8 @@ enum ErrorKind {
     ZeroSize,
     #[fail(display = "requested allocation overlaps an existing one")]
     Overlap,
-    #[fail(display = "requested location is not page-aligned")]
-    NotAligned,
+    #[fail(display = "requested location {:#X} is not page-aligned", _0)]
+    NotAligned(usize),
 }
 
 /*
