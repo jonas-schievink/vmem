@@ -235,8 +235,12 @@ impl ReservedMemory {
     ///
     /// # Parameters
     ///
-    /// * `offset`: Offset into the reserved address space.
+    /// * `offset`: Offset into the reserved address space. The offset must be
+    ///   aligned to whole pages, whose size can be obtained by calling
+    ///   [`page_size`].
     /// * `bytes`: Number of bytes to allocate.
+    ///
+    /// [`page_size`]: #method.page_size
     pub fn allocate(
         &self,
         offset: usize,
