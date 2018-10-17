@@ -30,7 +30,7 @@ mod imp {
 
     use self::libc::{
         c_void, c_int, mmap, munmap, mprotect, PROT_NONE, PROT_READ, PROT_WRITE, PROT_EXEC,
-        MAP_PRIVATE, MAP_ANONYMOUS, MAP_FIXED, MAP_FAILED
+        MAP_PRIVATE, MAP_ANONYMOUS, MAP_FAILED
     };
     use Protection;
     use std::{io, usize};
@@ -62,12 +62,16 @@ mod imp {
     /// This can assume that `addr` is already reserved and that `bytes` fits in
     /// the reserved memory.
     pub fn alloc(addr: usize, bytes: usize) -> Result<(), io::Error> {
-        let ret = unsafe {
-            map(addr, bytes, Some(Protection::ReadWrite), MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED)?
-        };
-        assert_eq!(addr, ret as usize);
-        Ok(())
+        unsafe {
+            if mprotect(addr as *mut _, bytes, self::prot(Protection::ReadWrite)) == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        }
     }
+
+    // Deallocation would need to repeat the `mmap` with `PROT_NONE`.
 
     /// Free all mappings (allocations and reservations) overlapping any address
     /// between `addr` and `addr+bytes`.
