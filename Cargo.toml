@@ -8,20 +8,21 @@ repository = "https://github.com/jonas-schievink/vmem.git"
 keywords = ["virtual", "memory", "mmap", "memory", "map"]
 categories = ["memory-management"]
 readme = "README.md"
-license = "CC0-1.0"
+license = "0BSD"
+edition = "2018"
 
 [dependencies]
-failure = "0.1.2"
+failure = "0.1.5"
 page_size = "0.4.1"
 
 [dev-dependencies]
-version-sync = "0.5"
+version-sync = "0.8.1"
 
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3.5", features = ["memoryapi"] }
+winapi = { version = "0.3.7", features = ["memoryapi"] }
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2.43"
+libc = "0.2.51"
 
 
 # cargo-release configuration
